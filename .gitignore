@@ -1,0 +1,13 @@
+# Local agent tooling & archive backups
+.agents/
+skills-lock.json
+WEBSITES.zip
+
+# Environment secrets & local dependencies (for backend work)
+.env
+.env.*
+node_modules/
+
+# OS junk
+.DS_Store
+Thumbs.db
