@@ -1841,11 +1841,13 @@ select.field{
   </div>
 </dialog>
 
+<script src="supabase-config.js"></script>
+<script src="supabase-api.js"></script>
 <script>
 /* ============================================================================
    1. NORMALIZED RELATIONAL DATA MODELS (ROOMS, BEDS, MEDS, VISITS/LEDGERS)
    ============================================================================ */
-const ILLNESS_BY_CONTAGIOUS = {
+let ILLNESS_BY_CONTAGIOUS = {
     "Contagious": [
         "Infectious / Respiratory",
         "Isolation Critical",
@@ -2536,7 +2538,7 @@ function renderDoctorSelects() {
     }
 }
 
-const DOCTOR_FEES = {
+let DOCTOR_FEES = {
     "Dr. Emily Santos": 600,
     "Dr. Marcus Cruz": 750,
     "Dr. Sofia Reyes": 500,
@@ -2544,12 +2546,66 @@ const DOCTOR_FEES = {
 };
 
 const SLOTS = ["09:00 AM","10:00 AM","11:00 AM","01:00 PM","02:00 PM","03:00 PM","04:00 PM"];
-const DOCTORS = [
+let DOCTORS = [
     { name: "Dr. Emily Santos", spec: "Cardiology" },
     { name: "Dr. Marcus Cruz", spec: "General Surgery" },
     { name: "Dr. Sofia Reyes", spec: "Pediatrics" },
     { name: "Dr. Antonio Luna", spec: "Internal Medicine" }
 ];
+
+function isSupabaseLive() {
+    return Boolean(window.UnicareBackend && typeof window.UnicareBackend.isConfigured === 'function' && window.UnicareBackend.isConfigured());
+}
+
+function mapRpcReceiptToModalData(rpcRes, { isHistoryView = false, bedAlreadyReleased = false } = {}) {
+    const fmt = (iso) => (window.UnicareBackend && window.UnicareBackend.formatDisplayTimestamp(iso)) || formatSettlementDate(new Date());
+    return {
+        paymentType: rpcRes.payment_type || 'Paid',
+        orNumber: rpcRes.or_number || '—',
+        patientName: rpcRes.patient_name || '—',
+        visitType: rpcRes.visit_type || 'Inpatient',
+        wardReleased: rpcRes.ward_released || '—',
+        issuedAt: rpcRes.issued_at ? fmt(rpcRes.issued_at) : null,
+        issuedByRole: rpcRes.issued_by_role || null,
+        paidAt: rpcRes.paid_at ? fmt(rpcRes.paid_at) : null,
+        paidByRole: rpcRes.paid_by_role || null,
+        settledAt: fmt(rpcRes.settled_at || rpcRes.paid_at || rpcRes.issued_at),
+        settledByRole: rpcRes.settled_by_role || currentRole,
+        items: Array.isArray(rpcRes.items) ? rpcRes.items : [],
+        grossSubtotal: Number(rpcRes.gross_subtotal || 0),
+        discount: Number(rpcRes.discount || 0),
+        surcharge: Number(rpcRes.surcharge || 0),
+        finalTotal: Number(rpcRes.final_total || 0),
+        isHistoryView,
+        bedAlreadyReleased
+    };
+}
+
+let _stayDaysSyncTimer = null;
+async function refreshFromSupabase() {
+    if (!isSupabaseLive()) return null;
+    const state = await window.UnicareBackend.loadOperationalState();
+    if (state.doctors && state.doctors.length) DOCTORS = state.doctors;
+    if (state.doctorFees) DOCTOR_FEES = state.doctorFees;
+    if (state.illnessByContagious) ILLNESS_BY_CONTAGIOUS = state.illnessByContagious;
+    if (state.rooms) rooms = state.rooms;
+    if (state.medications) medications = state.medications;
+    if (state.ledgers) ledgers = state.ledgers;
+    if (state.appointments) appointments = state.appointments;
+    if (state.disposalLog) disposalLog = state.disposalLog;
+    sessionHistoryOverride = Boolean(state.hasHistoryOverride && currentRole !== 'Hospital Administrator');
+
+    renderDoctorSelects();
+    syncAdmissionIllnessOptions();
+    renderBeds();
+    renderBasket();
+    renderPharmacy();
+    renderTriage();
+    renderBillingOptions();
+    renderSettlementHistory();
+    updateDashboardMetrics();
+    return state;
+}
 
 // Clean inline SVG portraits so zero empty grey silhouettes appear
 function makeDoctorSvg(bg, coat, hair) {
@@ -3579,11 +3635,39 @@ function openLoginScreen() {
     openNativeDialog(dlg);
 }
 
-function handleStaffLogin(e) {
+async function handleStaffLogin(e) {
     e.preventDefault();
     if (!validateFormControls(e.target)) return;
     const role = document.getElementById('login-role').value;
     const uname = (document.getElementById('login-username').value || '').trim() || 'admin.recto';
+    const pw = document.getElementById('login-password').value || '';
+    const roleRoutes = {
+        "Hospital Administrator": "dashboard",
+        "Front Desk & Admissions Staff": "inpatient",
+        "Hospital Pharmacist": "pharmacy",
+        "Billing & Discharge Officer": "billing"
+    };
+
+    if (isSupabaseLive()) {
+        try {
+            const profile = await window.UnicareBackend.signIn(uname, pw, role);
+            currentUsername = profile.username || uname;
+            currentRole = profile.role || role;
+            const initials = currentRole.split(' ').filter(w => w[0] && w[0] === w[0].toUpperCase()).map(w => w[0]).slice(0, 2).join('') || 'ST';
+            document.getElementById('session-role-label').textContent = currentRole;
+            document.getElementById('session-avatar').textContent = initials;
+            closeTopLayer(document.getElementById('login-screen'));
+            await refreshFromSupabase();
+            await window.UnicareBackend.subscribeRealtime(() => { refreshFromSupabase().catch(() => {}); });
+            applyRoleNav();
+            switchView(roleRoutes[currentRole] || "dashboard", { focusHeading: true });
+            showAlert(`Supabase Session Authenticated: Logged in as ${currentRole} (${currentUsername}).`);
+        } catch (err) {
+            showAlert(`Authentication Failed: ${err.message || 'Unable to sign in.'}`, true);
+        }
+        return;
+    }
+
     const initials = role.split(' ').filter(w => w[0] && w[0] === w[0].toUpperCase()).map(w => w[0]).slice(0, 2).join('') || 'ST';
     document.getElementById('session-role-label').textContent = role;
     document.getElementById('session-avatar').textContent = initials;
@@ -3594,12 +3678,6 @@ function handleStaffLogin(e) {
     sessionHistoryOverride = false;
     applyRoleNav();
     renderSettlementHistory();
-    const roleRoutes = {
-        "Hospital Administrator": "dashboard",
-        "Front Desk & Admissions Staff": "inpatient",
-        "Hospital Pharmacist": "pharmacy",
-        "Billing & Discharge Officer": "billing"
-    };
     switchView(roleRoutes[role] || "dashboard", { focusHeading: true });
     showAlert(`Session Authenticated: Logged in as ${role} (${uname}).`);
 }
@@ -3898,7 +3976,7 @@ function renderBeds() {
     updateAdmitBedDropdown(false);
 }
 
-function handleAdmitPatient(e) {
+async function handleAdmitPatient(e) {
     e.preventDefault();
     if (!validateFormControls(e.target)) return;
     const name = document.getElementById('admit-name').value.trim();
@@ -3926,6 +4004,24 @@ function handleAdmitPatient(e) {
     }
     if (bed.status === 'Occupied') {
         showAlert(`Hard Block Error: ${room.room} (${bed.label}) is already occupied by ${bed.patient}!`, true);
+        return;
+    }
+
+    if (isSupabaseLive()) {
+        try {
+            await window.UnicareBackend.admitInpatient({
+                patientName: name,
+                contagiousStatus,
+                illnessCategory,
+                bedId,
+                doctorName: doctor
+            });
+            document.getElementById('admit-form').reset();
+            await refreshFromSupabase();
+            showAlert(`Admission Verified: ${name} (${contagiousStatus} • ${illnessCategory}) assigned to ${room.room} (${bed.label}) under ${doctor}.`);
+        } catch (err) {
+            showAlert(`Admission Error: ${err.message || 'Database rejected admission.'}`, true);
+        }
         return;
     }
 
@@ -4180,9 +4276,21 @@ function disposeExpiredMedication(medId) {
             { label: 'Batch', value: med.batch },
             { label: 'Expiry Date', value: med.expiry }
         ],
-        onConfirm: () => {
+        onConfirm: async () => {
             const target = getActiveMedications().find(m => m.id === medId);
             if (!target) return;
+            if (isSupabaseLive()) {
+                try {
+                    await window.UnicareBackend.disposeExpiredBatch(target.id);
+                    stagedBasket = stagedBasket.filter(item => item.drugId !== medId);
+                    await refreshFromSupabase();
+                    renderBasket();
+                    showAlert(`Expired Stock Disposed: Quarantined ${target.name} (${target.id} • Batch ${target.batch}, Exp: ${target.expiry}) in PostgreSQL.`);
+                } catch (err) {
+                    showAlert(`Disposal Failed: ${err.message || 'Database error.'}`, true);
+                }
+                return;
+            }
             const disposedAt = formatSettlementDate(new Date());
             disposalLog.push({
                 id: disposalLog.length + 1,
@@ -4310,7 +4418,7 @@ function renderBasket() {
     document.getElementById('basket-total').textContent = `₱${total.toFixed(2)}`;
 }
 
-function finalizePrescriptionDispense() {
+async function finalizePrescriptionDispense() {
     const basketErr = document.getElementById('basket-empty-error');
     if (stagedBasket.length === 0) {
         if (basketErr) basketErr.style.display = 'flex';
@@ -4340,6 +4448,30 @@ function finalizePrescriptionDispense() {
             showAlert(`Stock Error: ${med.name} has only ${med.stock} unit(s) available (requested ${bItem.qty}).`, true);
             return;
         }
+    }
+
+    if (isSupabaseLive()) {
+        try {
+            const billingLedgerId = patientVal === 'walkin' ? null : parseInt(patientVal, 10);
+            const walkinName = patientVal === 'walkin' ? document.getElementById('dispense-walkin-name').value.trim() : null;
+            const res = await window.UnicareBackend.dispensePrescription({
+                billingLedgerId,
+                walkinName,
+                items: stagedBasket.map(item => ({ drug_code: item.drugId, qty: item.qty }))
+            });
+            stagedBasket = [];
+            if (patientVal === 'walkin') document.getElementById('dispense-walkin-name').value = '';
+            await refreshFromSupabase();
+            renderBasket();
+            if (patientVal === 'walkin') {
+                showAlert(`Routed to Billing Cashier: Created ticket ${res.account_label} (${fmtPeso(res.total_dispensed)}) in Billing & Discharge queue.`);
+            } else {
+                showAlert(`Ledger Updated: Attached ${fmtPeso(res.total_dispensed)} itemized pharmacy charges to ${res.account_label} (${res.visit_type}).`);
+            }
+        } catch (err) {
+            showAlert(`Dispense Error: ${err.message || 'Database rejected dispense.'}`, true);
+        }
+        return;
     }
 
     let basketCost = 0;
@@ -4402,7 +4534,7 @@ function closeAddDrugModal() {
     closeTopLayer(document.getElementById('add-drug-modal'));
 }
 
-function handleAddNewDrug(e) {
+async function handleAddNewDrug(e) {
     e.preventDefault();
     const idInput = document.getElementById('modal-drug-id');
     validateUniqueDrugId(idInput);
@@ -4415,6 +4547,28 @@ function handleAddNewDrug(e) {
     const price = parseFloat(document.getElementById('modal-drug-price').value);
     const stock = parseInt(document.getElementById('modal-drug-stock').value, 10);
     const expiry = document.getElementById('modal-drug-expiry').value;
+
+    if (isSupabaseLive()) {
+        try {
+            await window.UnicareBackend.upsertMedicationStock({
+                drugCode: id,
+                batchNo: batch,
+                genericName: name,
+                dosageForm: form,
+                unitPrice: price,
+                stockQty: stock,
+                expiryDate: expiry,
+                lowStockLimit: 15,
+                source: 'ADD_STOCK'
+            });
+            closeAddDrugModal();
+            await refreshFromSupabase();
+            showAlert(`Catalog Updated: Added ${name} (${form}) to PostgreSQL inventory.`);
+        } catch (err) {
+            showAlert(`Catalog Update Failed: ${err.message || 'Database error.'}`, true);
+        }
+        return;
+    }
 
     const disposedMatch = medications.find(m => m.isDisposed && m.id.toUpperCase() === id.toUpperCase());
     if (disposedMatch) {
@@ -4465,9 +4619,7 @@ function importPharmacyCsvText(csvText, fileName = 'inventory.csv') {
         .map(l => l.trim())
         .filter(Boolean);
 
-    let imported = 0;
-    let updated = 0;
-    let added = 0;
+    const validRows = [];
     let skipped = 0;
 
     lines.forEach((line, lineIdx) => {
@@ -4487,7 +4639,41 @@ function importPharmacyCsvText(csvText, fileName = 'inventory.csv') {
             skipped++;
             return;
         }
+        validRows.push({ id, batch, name, form, price, stock, expiry });
+    });
 
+    if (validRows.length === 0) {
+        showAlert(`Import Failed: No valid medication rows found in [${fileName}]. Expected columns: id, batch, name, form, price, stock, expiry.`, true);
+        return { imported: 0, updated: 0, added: 0, skipped };
+    }
+
+    if (isSupabaseLive()) {
+        return window.UnicareBackend.importPharmacyCsvBatch(
+            validRows.map(r => ({
+                drug_code: r.id,
+                batch_no: r.batch,
+                generic_name: r.name,
+                dosage_form: r.form,
+                unit_price: r.price,
+                stock_qty: r.stock,
+                expiry_date: r.expiry
+            }))
+        ).then(async (res) => {
+            await refreshFromSupabase();
+            renderBasket();
+            const skippedNote = skipped ? ` (${skipped} invalid row${skipped === 1 ? '' : 's'} skipped)` : '';
+            showAlert(`Imported ${res.imported} medication record(s) from [${fileName}]${skippedNote}.`);
+            return { imported: res.imported, updated: res.updated, added: res.added, skipped };
+        }).catch(err => {
+            showAlert(`CSV Import Failed: ${err.message || 'Database rejected CSV batch.'}`, true);
+            return { imported: 0, updated: 0, added: 0, skipped };
+        });
+    }
+
+    let imported = 0;
+    let updated = 0;
+    let added = 0;
+    validRows.forEach(({ id, batch, name, form, price, stock, expiry }) => {
         const existing = medications.find(m => m.id.toUpperCase() === id.toUpperCase());
         if (existing) {
             existing.batch = batch;
@@ -4506,11 +4692,6 @@ function importPharmacyCsvText(csvText, fileName = 'inventory.csv') {
         }
         imported++;
     });
-
-    if (imported === 0) {
-        showAlert(`Import Failed: No valid medication rows found in [${fileName}]. Expected columns: id, batch, name, form, price, stock, expiry.`, true);
-        return { imported: 0, updated: 0, added: 0, skipped };
-    }
 
     renderPharmacy();
     renderBasket();
@@ -4603,7 +4784,7 @@ function renderTriage() {
     syncTriageSlotHints();
 }
 
-function handleBookAppointment(e) {
+async function handleBookAppointment(e) {
     e.preventDefault();
     const slotSelect = document.getElementById('app-timeslot');
     slotSelect.setCustomValidity('');
@@ -4618,6 +4799,22 @@ function handleBookAppointment(e) {
         slotSelect.setCustomValidity(`${doctor} at ${time} is full (3/3 patients). Choose another slot.`);
         validateFormControls(e.target);
         showAlert(`Scheduling Error: ${doctor} slot at ${time} has reached maximum capacity of 3 patients!`, true);
+        return;
+    }
+
+    if (isSupabaseLive()) {
+        try {
+            const res = await window.UnicareBackend.bookAppointment({
+                patientName,
+                doctorName: doctor,
+                timeSlot: time
+            });
+            document.getElementById('appointment-form').reset();
+            await refreshFromSupabase();
+            showAlert(`Appointment Confirmed: ${patientName} queued for ${doctor} at ${time} (Position ${res.queue_position}/3) & Outpatient Bill opened.`);
+        } catch (err) {
+            showAlert(`Scheduling Error: ${err.message || 'Database rejected appointment.'}`, true);
+        }
         return;
     }
 
@@ -4878,6 +5075,15 @@ function handleStayDaysChange() {
     document.getElementById('bill-room-cost').textContent = `₱${roomCost.toFixed(2)}`;
     recalculateTotalBill();
     updateDashboardMetrics();
+
+    if (isSupabaseLive()) {
+        clearTimeout(_stayDaysSyncTimer);
+        _stayDaysSyncTimer = setTimeout(() => {
+            window.UnicareBackend.updateInpatientStayDays(ledger.id, parsed).catch(err => {
+                showAlert(`Stay Duration Sync Error: ${err.message || 'Unable to save stay days.'}`, true);
+            });
+        }, 300);
+    }
 }
 
 function recalculateTotalBill() {
@@ -4997,10 +5203,22 @@ function viewSelectedPromissoryReceipt() {
     if (!Number.isNaN(ledgerId)) viewSettlementReceipt(ledgerId);
 }
 
-function settlePromissoryLedger(ledgerId) {
+async function settlePromissoryLedger(ledgerId) {
     const ledger = ledgers.find(l => l.id === ledgerId && l.status === 'Promissory Note');
     if (!ledger) {
         showAlert('Billing Notice: Selected Promissory Note account is no longer unpaid.', true);
+        return;
+    }
+
+    if (isSupabaseLive()) {
+        try {
+            const rpcRes = await window.UnicareBackend.settlePromissoryNote(ledgerId);
+            await refreshFromSupabase();
+            showAlert(`Promissory Note Paid: ${rpcRes.patient_name} (${rpcRes.or_number}) settled ${fmtPeso(rpcRes.final_total)} in full. Moved to Collected Earnings.`);
+            openReceiptModal(mapRpcReceiptToModalData(rpcRes, { isHistoryView: false, bedAlreadyReleased: true }));
+        } catch (err) {
+            showAlert(`Billing Error: ${err.message || 'Unable to settle promissory note.'}`, true);
+        }
         return;
     }
 
@@ -5033,7 +5251,7 @@ function settlePromissoryLedger(ledgerId) {
     openReceiptModal(buildReceiptDataFromLedger(ledger, { isHistoryView: false, bedAlreadyReleased: true }));
 }
 
-function processDischarge(paymentType) {
+async function processDischarge(paymentType) {
     const ledgerId = parseInt(document.getElementById('billing-patient-select').value, 10);
     const ledger = ledgers.find(l => l.id === ledgerId && (l.status === 'Active' || l.status === 'Promissory Note'));
     if (!ledger) {
@@ -5042,7 +5260,7 @@ function processDischarge(paymentType) {
     }
 
     if (ledger.status === 'Promissory Note') {
-        settlePromissoryLedger(ledger.id);
+        await settlePromissoryLedger(ledger.id);
         return;
     }
 
@@ -5095,6 +5313,30 @@ function processDischarge(paymentType) {
 
     const discount = Number(rawDiscount.toFixed(2));
     const surcharge = Number(rawSurcharge.toFixed(2));
+
+    if (isSupabaseLive()) {
+        try {
+            clearTimeout(_stayDaysSyncTimer);
+            if (ledger.visitType === 'Inpatient' && ledger.bedId) {
+                await window.UnicareBackend.updateInpatientStayDays(ledger.id, ledger.days);
+            }
+            const rpcRes = await window.UnicareBackend.settleBillingLedger(ledger.id, paymentType, discount, surcharge);
+            discountInput.value = 0;
+            surchargeInput.value = 0;
+            syncFieldAria(discountInput, false);
+            syncFieldAria(surchargeInput, false);
+            await refreshFromSupabase();
+            if (paymentType === 'Paid') {
+                showAlert(`${rpcRes.visit_type === 'Inpatient' ? 'Discharge Complete' : `${rpcRes.visit_type} Settled`}: ${rpcRes.patient_name} paid ${fmtPeso(rpcRes.final_total)} [${rpcRes.or_number} • Paid].`);
+            } else {
+                showAlert(`Promissory Note Issued: ${rpcRes.patient_name} (${rpcRes.visit_type}) recorded under Promissory Receivables (${fmtPeso(rpcRes.final_total)}) [${rpcRes.or_number}].`);
+            }
+            openReceiptModal(mapRpcReceiptToModalData(rpcRes, { isHistoryView: false, bedAlreadyReleased: false }));
+        } catch (err) {
+            showAlert(`Settlement Error: ${err.message || 'Database rejected settlement.'}`, true);
+        }
+        return;
+    }
     const finalTotal = Number((grossSubtotal - discount + surcharge).toFixed(2));
     const finalAmount = fmtPeso(finalTotal);
 
@@ -5220,25 +5462,51 @@ function setHistoryFilter(filter) {
     renderSettlementHistory();
 }
 
-function lockSettlementHistory() {
+async function lockSettlementHistory() {
+    if (isSupabaseLive()) {
+        try {
+            await window.UnicareBackend.revokeHistoryOverride();
+            sessionHistoryOverride = false;
+            await refreshFromSupabase();
+            showAlert('Settlement History locked for this session.');
+        } catch (err) {
+            showAlert(`Lock Error: ${err.message || 'Unable to lock session.'}`, true);
+        }
+        return;
+    }
     sessionHistoryOverride = false;
     renderSettlementHistory();
     showAlert('Settlement History locked for this session.');
 }
 
-function handleAdminHistoryUnlock(e) {
+async function handleAdminHistoryUnlock(e) {
     e.preventDefault();
     const userInput = document.getElementById('admin-unlock-username');
     const pwInput = document.getElementById('admin-unlock-password');
     const uname = (userInput.value || '').trim();
 
     userInput.setCustomValidity('');
-    if (uname.length >= 3 && !/^admin(\.[a-z0-9_-]+)?$|^administrator$/i.test(uname)) {
+    if (!isSupabaseLive() && uname.length >= 3 && !/^admin(\.[a-z0-9_-]+)?$|^administrator$/i.test(uname)) {
         userInput.setCustomValidity('Enter an authorized Administrator username (e.g. admin.recto).');
     }
 
     if (!validateFormControls(e.target)) {
         showAlert('Admin Authorization Failed: Provide valid Administrator credentials to unlock Settlement History.', true);
+        return;
+    }
+
+    if (isSupabaseLive()) {
+        try {
+            const profile = window.UnicareBackend.getCurrentProfile();
+            if (!profile || !profile.id) throw new Error('Active staff session not found.');
+            await window.UnicareBackend.verifyAdminAndGrantHistoryOverride(uname, pwInput.value || '', profile.id, 30);
+            sessionHistoryOverride = true;
+            closeTopLayer(document.getElementById('admin-unlock-modal'));
+            await refreshFromSupabase();
+            showAlert(`Admin Authorization Verified: Settlement History unlocked for 30 minutes (${uname}).`);
+        } catch (err) {
+            showAlert(`Admin Authorization Failed: ${err.message || 'Invalid Administrator credentials.'}`, true);
+        }
         return;
     }
 
@@ -5696,19 +5964,52 @@ document.addEventListener("DOMContentLoaded", () => {
     renderTriage();
     renderBillingOptions();
 
-    const activeMedsStartup = getActiveMedications();
-    const lowCount = activeMedsStartup.filter(m => m.stock < m.lowLimit).length;
-    const expCount = activeMedsStartup.filter(m => getDaysUntilExpiry(m.expiry) <= 60).length;
-    if (lowCount + expCount > 0) {
-        pushNotificationItem(`Pharmacy Stock Monitor: ${lowCount} low-stock item(s) and ${expCount} near-expiry/expired item(s) require attention.`, true);
-    }
-
     applyRoleNav();
     updateLiveClock();
     setInterval(updateLiveClock, 1000);
     updateDashboardMetrics();
     switchView('dashboard', { animate: false, focusHeading: false });
     syncSidebarResponsive();
+
+    if (isSupabaseLive()) {
+        const loginPw = document.getElementById('login-password');
+        if (loginPw) loginPw.value = '';
+        (async () => {
+            try {
+                const profile = await window.UnicareBackend.restoreSession();
+                if (!profile) {
+                    openLoginScreen();
+                    return;
+                }
+                currentUsername = profile.username;
+                currentRole = profile.role;
+                const initials = currentRole.split(' ').filter(w => w[0] && w[0] === w[0].toUpperCase()).map(w => w[0]).slice(0, 2).join('') || 'ST';
+                document.getElementById('session-role-label').textContent = currentRole;
+                document.getElementById('session-avatar').textContent = initials;
+                applyRoleNav();
+                await refreshFromSupabase();
+                await window.UnicareBackend.subscribeRealtime(() => { refreshFromSupabase().catch(() => {}); });
+                const roleRoutes = {
+                    "Hospital Administrator": "dashboard",
+                    "Front Desk & Admissions Staff": "inpatient",
+                    "Hospital Pharmacist": "pharmacy",
+                    "Billing & Discharge Officer": "billing"
+                };
+                switchView(roleRoutes[currentRole] || 'dashboard', { animate: false, focusHeading: false });
+            } catch (err) {
+                openLoginScreen();
+                showAlert(`Supabase Connection Notice: ${err.message || 'Sign in to connect.'}`, true);
+            }
+        })();
+    } else {
+        const activeMedsStartup = getActiveMedications();
+        const lowCount = activeMedsStartup.filter(m => m.stock < m.lowLimit).length;
+        const expCount = activeMedsStartup.filter(m => getDaysUntilExpiry(m.expiry) <= 60).length;
+        if (lowCount + expCount > 0) {
+            pushNotificationItem(`Pharmacy Stock Monitor: ${lowCount} low-stock item(s) and ${expCount} near-expiry/expired item(s) require attention.`, true);
+        }
+        pushNotificationItem('Local Preview Mode: Configure supabase-config.js to connect to your live Supabase PostgreSQL database.', false);
+    }
 
     if (typeof mobileNavMQ.addEventListener === 'function') {
         mobileNavMQ.addEventListener('change', syncSidebarResponsive);
