@@ -1111,12 +1111,14 @@ begin
         raise exception 'Attending specialist (%) not found or inactive', p_doctor_name;
     end if;
 
+    -- Serialize concurrent admissions on the same bed without requiring UPDATE RLS on reference table beds
+    perform pg_advisory_xact_lock(hashtext('unicare_bed|' || p_bed_id::text));
+
     select b.id, b.bed_label, r.room_name
     into v_bed
     from public.beds b
     join public.rooms r on r.id = b.room_id
-    where b.id = p_bed_id and b.is_active = true
-    for update of b;
+    where b.id = p_bed_id and b.is_active = true;
 
     if not found then
         raise exception 'Selected bed (%) does not exist or is inactive', p_bed_id;
@@ -1318,6 +1320,8 @@ declare
     v_total_cost numeric(12,2) := 0;
     v_days_left integer;
     v_new_balance integer;
+    v_expected_lines integer := 0;
+    v_locked_lines integer := 0;
 begin
     if v_role not in ('Hospital Administrator', 'Hospital Pharmacist') then
         raise exception 'Access denied: % cannot dispense medications', coalesce(v_role, 'unauthenticated');
@@ -1328,11 +1332,13 @@ begin
     end if;
 
     if v_ledger_id is not null then
+        -- Serialize concurrent dispense/settlement on the same ledger without requiring UPDATE RLS on billing_ledgers
+        perform pg_advisory_xact_lock(hashtext('unicare_ledger|' || v_ledger_id::text));
+
         select bl.status, bl.account_label, bl.visit_type
         into v_ledger_status, v_ledger_name, v_ledger_visit_type
         from public.billing_ledgers bl
-        where bl.id = v_ledger_id
-        for update of bl;
+        where bl.id = v_ledger_id;
 
         if not found then
             raise exception 'Target billing ledger (%) not found', v_ledger_id;
@@ -1358,7 +1364,23 @@ begin
         raise exception 'All dispensed quantities must be positive whole integers';
     end if;
 
-    -- Lock active batches ordered by medication_batches.id ASC to prevent deadlocks
+    select count(*)::integer into v_expected_lines from _dispense_lines;
+
+    -- Verify every requested drug_code maps to an Active batch before locking via INNER JOIN
+    for v_item in
+        select dl.drug_code
+        from _dispense_lines dl
+        where not exists (
+            select 1
+            from public.medications m
+            join public.medication_batches mb on mb.medication_id = m.id and mb.status = 'Active'
+            where upper(m.drug_code) = dl.drug_code
+        )
+    loop
+        raise exception 'Medication (%) is unavailable or has no active batch', v_item.drug_code;
+    end loop;
+
+    -- Lock active batches ordered by medication_batches.id ASC (INNER JOIN so FOR UPDATE OF mb is valid)
     for v_item in
         select
             dl.drug_code,
@@ -1372,14 +1394,12 @@ begin
             mb.expiry_date,
             mb.status as batch_status
         from _dispense_lines dl
-        left join public.medications m on upper(m.drug_code) = dl.drug_code
-        left join public.medication_batches mb on mb.medication_id = m.id and mb.status = 'Active'
-        order by mb.id asc nulls last
+        join public.medications m on upper(m.drug_code) = dl.drug_code
+        join public.medication_batches mb on mb.medication_id = m.id and mb.status = 'Active'
+        order by mb.id asc
         for update of mb
     loop
-        if v_item.medication_id is null or v_item.batch_id is null then
-            raise exception 'Medication (%) is unavailable or has no active batch', v_item.drug_code;
-        end if;
+        v_locked_lines := v_locked_lines + 1;
 
         v_days_left := (v_item.expiry_date - current_date)::integer;
         if v_days_left <= 30 then
@@ -1392,6 +1412,10 @@ begin
                 v_item.qty, v_item.generic_name, v_item.stock_qty;
         end if;
     end loop;
+
+    if v_locked_lines <> v_expected_lines then
+        raise exception 'One or more requested medications no longer have an active batch available';
+    end if;
 
     -- Create Walk-In OTC ledger after all inventory checks succeed
     if v_ledger_id is null then
@@ -1738,6 +1762,101 @@ $$;
 -- ----------------------------------------------------------------------------
 -- 7. RPCs: Billing Stay Days, Settlement & Promissory Note Payment
 -- ----------------------------------------------------------------------------
+-- Non-exposed private helpers allow Billing Officers to transition an Active or
+-- Promissory ledger to 'Paid' without triggering PostgreSQL's SELECT-on-new-row
+-- RLS check (billing.01 remains blocked from SELECTing Paid history without an
+-- active 30-minute Administrator override).
+create or replace function private.commit_billing_settlement(
+    p_ledger_id bigint,
+    p_payment_type text,
+    p_or_number text,
+    p_room_cost numeric,
+    p_doctor_cost numeric,
+    p_pharmacy_cost numeric,
+    p_gross numeric,
+    p_discount numeric,
+    p_surcharge numeric,
+    p_final_total numeric,
+    p_ward_released text,
+    p_now timestamptz,
+    p_actor_id uuid,
+    p_actor_role text
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_role text := private.current_staff_role();
+begin
+    if v_role not in ('Hospital Administrator', 'Billing & Discharge Officer') then
+        raise exception 'Access denied: % cannot commit billing settlements', coalesce(v_role, 'unauthenticated');
+    end if;
+
+    update public.billing_ledgers
+    set status = p_payment_type,
+        or_number = p_or_number,
+        room_cost = p_room_cost,
+        doctor_cost = p_doctor_cost,
+        pharmacy_cost = p_pharmacy_cost,
+        gross_subtotal = p_gross,
+        discount_amount = p_discount,
+        surcharge_amount = p_surcharge,
+        settled_total = p_final_total,
+        ward_released = p_ward_released,
+        issued_at = p_now,
+        issued_by = p_actor_id,
+        issued_by_role = p_actor_role,
+        paid_at = case when p_payment_type = 'Paid' then p_now else null end,
+        paid_by = case when p_payment_type = 'Paid' then p_actor_id else null end,
+        paid_by_role = case when p_payment_type = 'Paid' then p_actor_role else null end
+    where id = p_ledger_id
+      and status = 'Active';
+
+    if not found then
+        raise exception 'Billing ledger (%) could not be settled (not Active)', p_ledger_id;
+    end if;
+end;
+$$;
+
+create or replace function private.commit_promissory_payment(
+    p_ledger_id bigint,
+    p_now timestamptz,
+    p_actor_id uuid,
+    p_actor_role text
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+    v_role text := private.current_staff_role();
+begin
+    if v_role not in ('Hospital Administrator', 'Billing & Discharge Officer') then
+        raise exception 'Access denied: % cannot commit promissory payments', coalesce(v_role, 'unauthenticated');
+    end if;
+
+    update public.billing_ledgers
+    set status = 'Paid',
+        paid_at = p_now,
+        paid_by = p_actor_id,
+        paid_by_role = p_actor_role
+    where id = p_ledger_id
+      and status = 'Promissory Note';
+
+    if not found then
+        raise exception 'Selected account (%) is not an unpaid Promissory Note', p_ledger_id;
+    end if;
+end;
+$$;
+
+revoke all on function private.commit_billing_settlement(bigint, text, text, numeric, numeric, numeric, numeric, numeric, numeric, numeric, text, timestamptz, uuid, text) from public, anon;
+revoke all on function private.commit_promissory_payment(bigint, timestamptz, uuid, text) from public, anon;
+grant execute on function private.commit_billing_settlement(bigint, text, text, numeric, numeric, numeric, numeric, numeric, numeric, numeric, text, timestamptz, uuid, text) to authenticated;
+grant execute on function private.commit_promissory_payment(bigint, timestamptz, uuid, text) to authenticated;
+
 create or replace function public.update_inpatient_stay_days(
     p_billing_ledger_id bigint,
     p_stay_days integer
@@ -1832,6 +1951,8 @@ begin
         raise exception 'Discount and surcharge amounts must be 0 or greater';
     end if;
 
+    perform pg_advisory_xact_lock(hashtext('unicare_ledger|' || p_billing_ledger_id::text));
+
     select * into v_ledger
     from public.billing_ledgers bl
     where bl.id = p_billing_ledger_id
@@ -1919,25 +2040,24 @@ begin
 
     v_or_number := 'OR-' || to_char(current_date, 'YYYY-MMDD') || '-' || lpad(v_seq::text, 2, '0');
 
-    -- Update without RETURNING so Billing Officer RLS on Paid rows does not conflict
-    update public.billing_ledgers
-    set status = p_payment_type,
-        or_number = v_or_number,
-        room_cost = v_room_cost,
-        doctor_cost = v_doctor_cost,
-        pharmacy_cost = v_pharmacy_cost,
-        gross_subtotal = v_gross,
-        discount_amount = v_discount,
-        surcharge_amount = v_surcharge,
-        settled_total = v_final_total,
-        ward_released = v_ward_released,
-        issued_at = v_now,
-        issued_by = (select auth.uid()),
-        issued_by_role = v_role,
-        paid_at = case when p_payment_type = 'Paid' then v_now else null end,
-        paid_by = case when p_payment_type = 'Paid' then (select auth.uid()) else null end,
-        paid_by_role = case when p_payment_type = 'Paid' then v_role else null end
-    where id = v_ledger.id;
+    -- Commit status transition through non-exposed private helper so Billing Officer
+    -- SELECT-on-new-row RLS for Paid rows does not block cash settlement
+    perform private.commit_billing_settlement(
+        v_ledger.id,
+        p_payment_type,
+        v_or_number,
+        v_room_cost,
+        v_doctor_cost,
+        v_pharmacy_cost,
+        v_gross,
+        v_discount,
+        v_surcharge,
+        v_final_total,
+        v_ward_released,
+        v_now,
+        (select auth.uid()),
+        v_role
+    );
 
     if v_ledger.visit_type = 'Inpatient' and v_ledger.admission_id is not null then
         update public.admissions
@@ -2011,6 +2131,8 @@ begin
         raise exception 'Access denied: % cannot settle promissory notes', coalesce(v_role, 'unauthenticated');
     end if;
 
+    perform pg_advisory_xact_lock(hashtext('unicare_ledger|' || p_billing_ledger_id::text));
+
     select * into v_ledger
     from public.billing_ledgers bl
     where bl.id = p_billing_ledger_id
@@ -2072,13 +2194,14 @@ begin
 
     v_items := v_items || v_pharm_items;
 
-    -- Preserve issued_at / issued_by / issued_by_role untouched; record paid_* fields without RETURNING
-    update public.billing_ledgers
-    set status = 'Paid',
-        paid_at = v_now,
-        paid_by = (select auth.uid()),
-        paid_by_role = v_role
-    where id = v_ledger.id;
+    -- Preserve issued_at / issued_by / issued_by_role untouched; commit via private helper
+    -- so Billing Officer SELECT-on-new-row RLS for Paid rows does not block collection
+    perform private.commit_promissory_payment(
+        v_ledger.id,
+        v_now,
+        (select auth.uid()),
+        v_role
+    );
 
     insert into public.payment_events (billing_ledger_id, event_type, amount, performed_by, performed_by_role, created_at)
     values (v_ledger.id, 'PROMISSORY_PAID', v_ledger.settled_total, (select auth.uid()), v_role, v_now);
